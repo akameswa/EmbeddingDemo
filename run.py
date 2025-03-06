@@ -2,7 +2,6 @@ import os
 import base64
 import gradio as gr
 import json
-import shutil
 import random
 import time
 from PIL import Image
@@ -16,12 +15,11 @@ from threading import Thread
 import plotly.express as px
 import numpy as np
 from flask import Flask, send_file, request as flask_request
+from session import session_manager  
 
 flask_app = Flask(__name__)
 
-USER_SESSIONS_DIR = os.path.abspath("user_sessions")
-os.makedirs(USER_SESSIONS_DIR, exist_ok=True)
-print(f"User sessions directory: {USER_SESSIONS_DIR}")
+session_manager.start_cleanup_thread()
 
 default_examples = examples.copy()
 default_images = images.copy()
@@ -36,30 +34,24 @@ def get_user_dir(session_hash):
     """Get the main directory for a specific user's session"""
     if not session_hash:
         return None
-    user_dir = os.path.join(USER_SESSIONS_DIR, session_hash)
-    os.makedirs(user_dir, exist_ok=True)
+    user_dir = session_manager.get_session_path(session_hash)
+    print(f"User directory path: {user_dir.absolute()}")
     return user_dir
 
 def get_user_examples_dir(session_hash):
     """Get the examples directory for a specific user's session"""
     if not session_hash:
         return None
-    user_dir = get_user_dir(session_hash)
-    if not user_dir:
-        return None
-    examples_dir = os.path.join(user_dir, "examples")
-    os.makedirs(examples_dir, exist_ok=True)
+    examples_dir = session_manager.get_file_path(session_hash, "examples")
+    examples_dir.mkdir(exist_ok=True)
     return examples_dir
 
 def get_user_viz_dir(session_hash):
     """Get the visualizations directory for a specific user's session"""
     if not session_hash:
         return None
-    user_dir = get_user_dir(session_hash)
-    if not user_dir:
-        return None
-    viz_dir = os.path.join(user_dir, "visualizations")
-    os.makedirs(viz_dir, exist_ok=True)
+    viz_dir = session_manager.get_file_path(session_hash, "visualizations")
+    viz_dir.mkdir(exist_ok=True)
     return viz_dir
 
 @flask_app.route('/plot/<session_hash>')
@@ -67,35 +59,46 @@ def serve_user_plot(session_hash):
     user_dir = get_user_dir(session_hash)
     if not user_dir:
         return "Invalid session", 404
-        
-    html_path = os.path.join(user_dir, "embedding_plot.html")
-    print(f"Trying to serve file at: {html_path}")
-    print(f"File exists: {os.path.exists(html_path)}")
     
-    if os.path.exists(html_path):
+    html_path = user_dir / "embedding_plot.html"
+    abs_html_path = html_path.absolute()
+    str_html_path = str(abs_html_path)
+    
+    print(f"Trying to serve file at: {str_html_path}")
+    print(f"File exists: {html_path.exists()}")
+    print(f"Absolute path: {abs_html_path}")
+    
+    if html_path.exists():
         try:
-            return send_file(html_path, mimetype='text/html')
+            return send_file(str_html_path, mimetype='text/html')
         except Exception as e:
             print(f"Error serving file: {e}")
             return f"Error serving file: {e}", 500
     else:
-        return f"Plot not found at {html_path}", 404
+        return f"Plot not found at {str_html_path}", 404
 
 @flask_app.route('/examples/<session_hash>/<image_name>')
 def serve_user_example_image(session_hash, image_name):
     examples_dir = get_user_examples_dir(session_hash)
     if not examples_dir:
         return "Invalid session", 404
-        
-    image_path = os.path.join(examples_dir, image_name)
-    if os.path.exists(image_path):
+    
+    # Use absolute path
+    image_path = examples_dir / image_name
+    abs_image_path = image_path.absolute()
+    str_image_path = str(abs_image_path)
+    
+    print(f"Trying to serve image at: {str_image_path}")
+    print(f"Image exists: {image_path.exists()}")
+    
+    if image_path.exists():
         try:
-            return send_file(image_path, mimetype='image/jpeg')
+            return send_file(str_image_path, mimetype='image/jpeg')
         except Exception as e:
             print(f"Error serving user example image: {e}")
             return f"Error serving image: {e}", 500
     else:
-        return f"Image not found at {image_path}", 404
+        return f"Image not found at {str_image_path}", 404
 
 def run_flask_server():
     try:
@@ -117,22 +120,25 @@ def generate_user_html(session_hash):
     if not user_dir:
         return None
     
-    html_path = os.path.join(user_dir, "embedding_plot.html")
+    html_path = user_dir / "embedding_plot.html"
+    abs_html_path = html_path.absolute()
+    str_html_path = str(abs_html_path)
     
     user_fig = user_data[session_hash]["fig"]
     
     user_fig.write_html(
-        html_path,
+        str_html_path,
         full_html=True,
         include_plotlyjs='cdn',
         config={'responsive': True}
     )
     
-    print(f"Generated HTML at: {html_path}")
-    print(f"File exists after generation: {os.path.exists(html_path)}")
+    print(f"Generated HTML at: {str_html_path}")
+    print(f"File exists after generation: {html_path.exists()}")
+    print(f"Absolute path: {abs_html_path}")
     
     try:
-        os.chmod(html_path, 0o644)
+        os.chmod(str_html_path, 0o644)
     except Exception as e:
         print(f"Warning: Could not set file permissions: {e}")
     
@@ -235,8 +241,8 @@ def add_word_user(new_example, session_hash):
     
     examples_dir = get_user_examples_dir(session_hash)
     safe_filename = get_safe_filename(new_example)
-    image_path = os.path.join(examples_dir, f"{safe_filename}.jpg")
-    image.save(image_path, format="JPEG")
+    image_path = examples_dir / f"{safe_filename}.jpg"
+    image.save(str(image_path), format="JPEG")
     
     buffer = BytesIO()
     image.save(buffer, format="JPEG")
@@ -260,18 +266,18 @@ def remove_word_user(word_to_remove, session_hash):
     
     examples_dir = get_user_examples_dir(session_hash)
     safe_filename = get_safe_filename(word_to_remove)
-    image_path = os.path.join(examples_dir, f"{safe_filename}.jpg")
-    if os.path.exists(image_path):
+    image_path = examples_dir / f"{safe_filename}.jpg"
+    if image_path.exists():
         try:
-            os.remove(image_path)
+            image_path.unlink()  
         except Exception as e:
             print(f"Warning: Could not remove image file: {e}")
     
     viz_dir = get_user_viz_dir(session_hash)
-    viz_path = os.path.join(viz_dir, f"{safe_filename}_emb.png")
-    if os.path.exists(viz_path):
+    viz_path = viz_dir / f"{safe_filename}_emb.png"
+    if viz_path.exists():
         try:
-            os.remove(viz_path)
+            viz_path.unlink()  
         except Exception as e:
             print(f"Warning: Could not remove visualization file: {e}")
     
@@ -368,15 +374,16 @@ def generate_word_embedding_visualization(word, session_hash):
         if not examples_dir or not viz_dir:
             return None, None, "Error: Could not create directories"
         
-        emb_viz_b64 = generate_word_emb_vis(word, save_to_file=True, viz_dir=viz_dir)
+        str_viz_dir = str(viz_dir)
+        emb_viz_b64 = generate_word_emb_vis(word, save_to_file=True, viz_dir=str_viz_dir)
         
         emb_viz_bytes = base64.b64decode(emb_viz_b64.split(',')[1])
         emb_viz = Image.open(BytesIO(emb_viz_bytes))
         
-        image_path = os.path.join(examples_dir, f"{get_safe_filename(word)}.jpg")
+        image_path = examples_dir / f"{get_safe_filename(word)}.jpg"
         
-        if os.path.exists(image_path):
-            generated_img = Image.open(image_path)
+        if image_path.exists():
+            generated_img = Image.open(str(image_path))
         else:
             image = pipe(
                 prompt=word,
@@ -384,7 +391,7 @@ def generate_word_embedding_visualization(word, session_hash):
                 guidance_scale=guidance_scale,
             ).images[0]
             
-            image.save(image_path, format="JPEG")
+            image.save(str(image_path), format="JPEG")
             generated_img = image
         
         return emb_viz, generated_img, f"Visualization for '{word}'"
@@ -407,9 +414,9 @@ def load_user_gallery(session_hash):
     example_images = []
     
     for example in user_data[session_hash]["examples"]:
-        image_path = os.path.join(examples_dir, f"{get_safe_filename(example)}.jpg")
+        image_path = examples_dir / f"{get_safe_filename(example)}.jpg"
         
-        if not os.path.exists(image_path):
+        if not image_path.exists():
             try:
                 image = pipe(
                     prompt=example,
@@ -417,14 +424,14 @@ def load_user_gallery(session_hash):
                     guidance_scale=guidance_scale,
                 ).images[0]
                 
-                image.save(image_path, format="JPEG")
+                image.save(str(image_path), format="JPEG")
                 example_images.append((image, example))
             except Exception as e:
                 print(f"Error generating image for '{example}': {e}")
                 continue
         else:
             try:
-                image = Image.open(image_path)
+                image = Image.open(str(image_path))
                 example_images.append((image, example))
             except Exception as e:
                 print(f"Error loading image for '{example}': {e}")
@@ -557,21 +564,6 @@ with gr.Blocks(css="#step_size_circular {background-color: #666666} #step_size_c
             return []
         return load_user_gallery(session_hash)
 
-if os.path.exists(USER_SESSIONS_DIR):
-    for session_dir in os.listdir(USER_SESSIONS_DIR):
-        session_path = os.path.join(USER_SESSIONS_DIR, session_dir)
-        if os.path.isdir(session_path):
-            try:
-                shutil.rmtree(session_path)
-                print(f"Removed session directory: {session_path}")
-            except Exception as e:
-                print(f"Error removing session directory: {e}")
-        else:
-            try:
-                os.remove(session_path)
-                print(f"Removed file in sessions directory: {session_path}")
-            except Exception as e:
-                print(f"Error removing file: {e}")
 
 if __name__ == "__main__":
     try:
@@ -579,3 +571,4 @@ if __name__ == "__main__":
         demo.queue().launch(share=True)
     except KeyboardInterrupt:
         print("Server closed")
+        session_manager.stop_cleanup_thread()
