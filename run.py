@@ -7,6 +7,7 @@ import random
 import time
 from PIL import Image
 from io import BytesIO
+import matplotlib.pyplot as plt
 from base import *
 from params import *
 from embeddings import *
@@ -27,9 +28,47 @@ default_images = images.copy()
 default_coords = coords.copy()
 user_data = {}
 
+def get_safe_filename(word):
+    """Convert a word to a safe filename"""
+    return "".join([c if c.isalnum() else "_" for c in word])
+
+def get_user_dir(session_hash):
+    """Get the main directory for a specific user's session"""
+    if not session_hash:
+        return None
+    user_dir = os.path.join(USER_SESSIONS_DIR, session_hash)
+    os.makedirs(user_dir, exist_ok=True)
+    return user_dir
+
+def get_user_examples_dir(session_hash):
+    """Get the examples directory for a specific user's session"""
+    if not session_hash:
+        return None
+    user_dir = get_user_dir(session_hash)
+    if not user_dir:
+        return None
+    examples_dir = os.path.join(user_dir, "examples")
+    os.makedirs(examples_dir, exist_ok=True)
+    return examples_dir
+
+def get_user_viz_dir(session_hash):
+    """Get the visualizations directory for a specific user's session"""
+    if not session_hash:
+        return None
+    user_dir = get_user_dir(session_hash)
+    if not user_dir:
+        return None
+    viz_dir = os.path.join(user_dir, "visualizations")
+    os.makedirs(viz_dir, exist_ok=True)
+    return viz_dir
+
 @flask_app.route('/plot/<session_hash>')
 def serve_user_plot(session_hash):
-    html_path = os.path.abspath(os.path.join("user_sessions", session_hash, "embedding_plot.html"))
+    user_dir = get_user_dir(session_hash)
+    if not user_dir:
+        return "Invalid session", 404
+        
+    html_path = os.path.join(user_dir, "embedding_plot.html")
     print(f"Trying to serve file at: {html_path}")
     print(f"File exists: {os.path.exists(html_path)}")
     
@@ -41,6 +80,22 @@ def serve_user_plot(session_hash):
             return f"Error serving file: {e}", 500
     else:
         return f"Plot not found at {html_path}", 404
+
+@flask_app.route('/examples/<session_hash>/<image_name>')
+def serve_user_example_image(session_hash, image_name):
+    examples_dir = get_user_examples_dir(session_hash)
+    if not examples_dir:
+        return "Invalid session", 404
+        
+    image_path = os.path.join(examples_dir, image_name)
+    if os.path.exists(image_path):
+        try:
+            return send_file(image_path, mimetype='image/jpeg')
+        except Exception as e:
+            print(f"Error serving user example image: {e}")
+            return f"Error serving image: {e}", 500
+    else:
+        return f"Image not found at {image_path}", 404
 
 def run_flask_server():
     try:
@@ -54,8 +109,13 @@ flask_thread.daemon = True
 flask_thread.start()
 
 def generate_user_html(session_hash):
-    user_dir = os.path.abspath(os.path.join("user_sessions", session_hash))
-    os.makedirs(user_dir, exist_ok=True)
+    """Generate the HTML file for a user's session"""
+    if not session_hash:
+        return None
+    
+    user_dir = get_user_dir(session_hash)
+    if not user_dir:
+        return None
     
     html_path = os.path.join(user_dir, "embedding_plot.html")
     
@@ -114,6 +174,22 @@ def init_user_session(request: gr.Request):
         
         user_fig.update_traces(hoverinfo="none", hovertemplate=None)
         user_data[session_hash]["fig"] = user_fig
+        
+        examples_dir = get_user_examples_dir(session_hash)
+        
+        if examples_dir:
+            for example in user_data[session_hash]["examples"]:
+                image_path = os.path.join(examples_dir, f"{get_safe_filename(example)}.jpg")
+                if not os.path.exists(image_path):
+                    try:
+                        image = pipe(
+                            prompt=example,
+                            num_inference_steps=num_inference_steps,
+                            guidance_scale=guidance_scale,
+                        ).images[0]
+                        image.save(image_path, format="JPEG")
+                    except Exception as e:
+                        print(f"Error generating initial image for '{example}': {e}")
     
     html_path = generate_user_html(session_hash)
     
@@ -156,6 +232,12 @@ def add_word_user(new_example, session_hash):
         num_inference_steps=num_inference_steps,
         guidance_scale=guidance_scale,
     ).images[0]
+    
+    examples_dir = get_user_examples_dir(session_hash)
+    safe_filename = get_safe_filename(new_example)
+    image_path = os.path.join(examples_dir, f"{safe_filename}.jpg")
+    image.save(image_path, format="JPEG")
+    
     buffer = BytesIO()
     image.save(buffer, format="JPEG")
     encoded_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
@@ -175,6 +257,23 @@ def remove_word_user(word_to_remove, session_hash):
         return update_user_fig(session_hash)
         
     index = examplesMap[word_to_remove]
+    
+    examples_dir = get_user_examples_dir(session_hash)
+    safe_filename = get_safe_filename(word_to_remove)
+    image_path = os.path.join(examples_dir, f"{safe_filename}.jpg")
+    if os.path.exists(image_path):
+        try:
+            os.remove(image_path)
+        except Exception as e:
+            print(f"Warning: Could not remove image file: {e}")
+    
+    viz_dir = get_user_viz_dir(session_hash)
+    viz_path = os.path.join(viz_dir, f"{safe_filename}_emb.png")
+    if os.path.exists(viz_path):
+        try:
+            os.remove(viz_path)
+        except Exception as e:
+            print(f"Warning: Could not remove visualization file: {e}")
     
     user_data[session_hash]["coords"] = np.delete(user_coords, index, 0)
     user_data[session_hash]["images"].pop(index)
@@ -251,95 +350,228 @@ def set_axis_user(axis_name, which_axis, from_words, to_words, session_hash):
     
     return update_user_fig(session_hash)
 
+def generate_word_embedding_visualization(word, session_hash):
+    """Generate and save the word embedding visualization"""
+    if not session_hash or not word:
+        return None, None, "Invalid session or word"
+    
+    try:
+        if session_hash not in user_data:
+            return None, None, f"Invalid session"
+            
+        if word not in user_data[session_hash]["examples"]:
+            return None, None, f"Error: '{word}' not in examples"
+        
+        examples_dir = get_user_examples_dir(session_hash)
+        viz_dir = get_user_viz_dir(session_hash)
+        
+        if not examples_dir or not viz_dir:
+            return None, None, "Error: Could not create directories"
+        
+        emb_viz_b64 = generate_word_emb_vis(word, save_to_file=True, viz_dir=viz_dir)
+        
+        emb_viz_bytes = base64.b64decode(emb_viz_b64.split(',')[1])
+        emb_viz = Image.open(BytesIO(emb_viz_bytes))
+        
+        image_path = os.path.join(examples_dir, f"{get_safe_filename(word)}.jpg")
+        
+        if os.path.exists(image_path):
+            generated_img = Image.open(image_path)
+        else:
+            image = pipe(
+                prompt=word,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+            ).images[0]
+            
+            image.save(image_path, format="JPEG")
+            generated_img = image
+        
+        return emb_viz, generated_img, f"Visualization for '{word}'"
+    except Exception as e:
+        print(f"Error generating visualization for '{word}': {e}")
+        return None, None, f"Error: {str(e)}"
+
+def load_user_gallery(session_hash):
+    """Load the gallery of example images for this user"""
+    if not session_hash:
+        return []
+    
+    if session_hash not in user_data:
+        return []
+    
+    examples_dir = get_user_examples_dir(session_hash)
+    if not examples_dir:
+        return []
+    
+    example_images = []
+    
+    for example in user_data[session_hash]["examples"]:
+        image_path = os.path.join(examples_dir, f"{get_safe_filename(example)}.jpg")
+        
+        if not os.path.exists(image_path):
+            try:
+                image = pipe(
+                    prompt=example,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                ).images[0]
+                
+                image.save(image_path, format="JPEG")
+                example_images.append((image, example))
+            except Exception as e:
+                print(f"Error generating image for '{example}': {e}")
+                continue
+        else:
+            try:
+                image = Image.open(image_path)
+                example_images.append((image, example))
+            except Exception as e:
+                print(f"Error loading image for '{example}': {e}")
+                continue
+    
+    return example_images
+
 with gr.Blocks(css="#step_size_circular {background-color: #666666} #step_size_circular textarea {background-color: #666666}") as demo:
     gr.Markdown("## Stable Diffusion Embeddings Demo")
     
     session_hash_state = gr.State("")
     
-    with gr.TabItem("Embeddings"):
-        with gr.Row():
-            output = gr.HTML(
-                value="Loading...",
-                elem_id="embedding-html"
-            )
-        
-        with gr.Row():
-            word2add_rem = gr.Textbox(lines=1, label="Add/Remove word")
-            word2change = gr.Textbox(lines=1, label="Change image for word")
-            clear_words_button = gr.Button(value="Clear words")
-        
-        with gr.Accordion("Custom Semantic Dimensions", open=False):
+    with gr.Tabs():
+        with gr.TabItem("Embeddings"):
             with gr.Row():
-                axis_name_1 = gr.Textbox(label="Axis name", value="gender")
-                which_axis_1 = gr.Dropdown(
-                    choices=["X - Axis", "Y - Axis", "Z - Axis", "---"],
-                    value=whichAxisMap["which_axis_1"],
-                    label="Axis direction",
+                output = gr.HTML(
+                    value="Loading...",
+                    elem_id="embedding-html"
                 )
-                from_words_1 = gr.Textbox(
-                    lines=1,
-                    label="Positive",
-                    value="prince husband father son uncle",
-                )
-                to_words_1 = gr.Textbox(
-                    lines=1,
-                    label="Negative",
-                    value="princess wife mother daughter aunt",
-                )
-                submit_1 = gr.Button("Submit")
-        
-        def load_user_html(request: gr.Request):
-            flask_url, session_hash = init_user_session(request)
-            html_content = f"""
-            <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
-            """
-            return html_content, session_hash
-        
-        demo.load(load_user_html, None, [output, session_hash_state])
-        
-        @word2add_rem.submit(inputs=[word2add_rem, session_hash_state], outputs=[output, word2add_rem])
-        def add_rem_word_handler(words, session_hash):
-            flask_url = add_rem_word_user(words, session_hash)
-            html_content = f"""
-            <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
-            """
-            return html_content, ""
-        
-        @word2change.submit(inputs=[word2change, session_hash_state], outputs=[output, word2change])
-        def change_word_handler(word, session_hash):
-            flask_url = change_word_user(word, session_hash)
-            html_content = f"""
-            <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
-            """
-            return html_content, ""
-        
-        @clear_words_button.click(
-            fn=lambda session_hash: (
-                f"""<iframe id="html-frame" src="{clear_words_user(session_hash)}" style="width:100%; height:700px;"></iframe>"""
-            ),
-            inputs=[session_hash_state],
-            outputs=[output]
-        )
-        
-        @submit_1.click(
-            inputs=[axis_name_1, which_axis_1, from_words_1, to_words_1, session_hash_state],
-            outputs=[output],
-        )
-        def set_axis_wrapper(axis_name, which_axis, from_words, to_words, session_hash):
-            whichAxisMap["which_axis_1"] = which_axis
             
-            flask_url = set_axis_user(axis_name, which_axis, from_words, to_words, session_hash)
-            html_content = f"""
-            <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
-            """
-            return html_content
+            with gr.Row():
+                word2add_rem = gr.Textbox(lines=1, label="Add/Remove word")
+                word2change = gr.Textbox(lines=1, label="Change image for word")
+                clear_words_button = gr.Button(value="Clear words")
+            
+            with gr.Accordion("Custom Semantic Dimensions", open=False):
+                with gr.Row():
+                    axis_name_1 = gr.Textbox(label="Axis name", value="gender")
+                    which_axis_1 = gr.Dropdown(
+                        choices=["X - Axis", "Y - Axis", "Z - Axis", "---"],
+                        value=whichAxisMap["which_axis_1"],
+                        label="Axis direction",
+                    )
+                    from_words_1 = gr.Textbox(
+                        lines=1,
+                        label="Positive",
+                        value="prince husband father son uncle",
+                    )
+                    to_words_1 = gr.Textbox(
+                        lines=1,
+                        label="Negative",
+                        value="princess wife mother daughter aunt",
+                    )
+                    submit_1 = gr.Button("Submit")
+                    
+            with gr.Row():
+                with gr.Column(scale=1):
+                    word_input = gr.Textbox(
+                        label="Visualize embedding for word",
+                        lines=1
+                    )
+                
+                with gr.Column(scale=1):
+                    embedding_visualization = gr.Image(
+                        type="pil",
+                        interactive=False,
+                        height="6vw"
+                    )
+            
+            with gr.Row():
+                gallery = gr.Gallery(
+                    label="Images of words",
+                    show_label=True,
+                    elem_id="gallery",
+                    columns=4,
+                    height="auto"
+                )
+    
+    def load_user_html(request: gr.Request):
+        flask_url, session_hash = init_user_session(request)
+        html_content = f"""
+        <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
+        """
+        return html_content, session_hash
+    
+    demo.load(load_user_html, None, [output, session_hash_state])
+    
+    @word2add_rem.submit(inputs=[word2add_rem, session_hash_state], outputs=[output, word2add_rem, gallery])
+    def add_rem_word_handler(words, session_hash):
+        flask_url = add_rem_word_user(words, session_hash)
+        html_content = f"""
+        <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
+        """
+        gallery_images = load_user_gallery(session_hash)
+        return html_content, "", gallery_images
+    
+    @word2change.submit(inputs=[word2change, session_hash_state], outputs=[output, word2change, gallery])
+    def change_word_handler(word, session_hash):
+        flask_url = change_word_user(word, session_hash)
+        html_content = f"""
+        <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
+        """
+        gallery_images = load_user_gallery(session_hash)
+        return html_content, "", gallery_images
+    
+    @clear_words_button.click(inputs=[session_hash_state], outputs=[output, gallery])
+    def clear_words_handler(session_hash):
+        clear_url = clear_words_user(session_hash)
+        html_content = f"""<iframe id="html-frame" src="{clear_url}" style="width:100%; height:700px;"></iframe>"""
+        gallery_images = load_user_gallery(session_hash)
+        return html_content, gallery_images
+    
+    @submit_1.click(inputs=[axis_name_1, which_axis_1, from_words_1, to_words_1, session_hash_state], outputs=[output, gallery])
+    def set_axis_wrapper(axis_name, which_axis, from_words, to_words, session_hash):
+        whichAxisMap["which_axis_1"] = which_axis
+        
+        flask_url = set_axis_user(axis_name, which_axis, from_words, to_words, session_hash)
+        html_content = f"""
+        <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
+        """
+        gallery_images = load_user_gallery(session_hash)
+        return html_content, gallery_images
 
-if os.path.exists("user_sessions"):
-    for session_dir in os.listdir("user_sessions"):
-        try:
-            shutil.rmtree(os.path.join("user_sessions", session_dir))
-        except:
-            pass
+    @word_input.submit(inputs=[word_input, session_hash_state], outputs=[embedding_visualization, word_input, gallery])
+    def handle_word_visualization(word, session_hash):
+        if not word.strip():
+            return None, None, "Please enter a word", "", load_user_gallery(session_hash)
+            
+        emb_viz, generated_img, label = generate_word_embedding_visualization(word, session_hash)
+        
+        if "not in examples" in label:
+            gr.Warning(f"'{word}' not in examples. Please add it first using the Add/Remove word field.")
+            return None, None, "", load_user_gallery(session_hash)
+            
+        return emb_viz, "", load_user_gallery(session_hash)
+        
+    @demo.load(inputs=[session_hash_state], outputs=[gallery])
+    def load_gallery_on_start(session_hash):
+        if not session_hash:
+            return []
+        return load_user_gallery(session_hash)
+
+if os.path.exists(USER_SESSIONS_DIR):
+    for session_dir in os.listdir(USER_SESSIONS_DIR):
+        session_path = os.path.join(USER_SESSIONS_DIR, session_dir)
+        if os.path.isdir(session_path):
+            try:
+                shutil.rmtree(session_path)
+                print(f"Removed session directory: {session_path}")
+            except Exception as e:
+                print(f"Error removing session directory: {e}")
+        else:
+            try:
+                os.remove(session_path)
+                print(f"Removed file in sessions directory: {session_path}")
+            except Exception as e:
+                print(f"Error removing file: {e}")
 
 if __name__ == "__main__":
     try:

@@ -7,6 +7,7 @@ from diffusers import StableDiffusionPipeline
 import base64
 from io import BytesIO
 import plotly.express as px
+import os
 
 from base import *
 from params import *
@@ -156,11 +157,30 @@ def clear_words():
     return update_fig()
 
 
-def generate_word_emb_vis(prompt):
-    buf = BytesIO()
+def generate_word_emb_vis(prompt, save_to_file=False, viz_dir=None):
     emb = get_word_embeddings(prompt).reshape(77, 768)[1]
-    plt.imsave(buf, [emb], cmap="inferno")
-    img = "data:image/jpeg;base64, " + base64.b64encode(buf.getvalue()).decode("utf-8")
+    
+    plt.figure(figsize=(20, 3))
+    plt.imshow([emb], cmap="inferno", aspect='auto')
+    plt.xticks([])
+    plt.yticks([])
+    plt.tight_layout()
+    
+    buf = BytesIO()
+    plt.savefig(buf, format="png")
+    plt.close()
+    
+    if save_to_file and viz_dir:
+        os.makedirs(viz_dir, exist_ok=True)
+        safe_filename = "".join([c if c.isalnum() else "_" for c in prompt])
+        viz_path = os.path.join(viz_dir, f"{safe_filename}_emb.png")
+        try:
+            with open(viz_path, 'wb') as f:
+                f.write(buf.getvalue())
+        except Exception as e:
+            print(f"Error saving embedding to file: {e}")
+    
+    img = "data:image/png;base64, " + base64.b64encode(buf.getvalue()).decode("utf-8")
     return img
 
 
