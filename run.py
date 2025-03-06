@@ -4,6 +4,7 @@ import gradio as gr
 import json
 import shutil
 import random
+import time
 from PIL import Image
 from io import BytesIO
 from base import *
@@ -13,15 +14,47 @@ from clip_config import *
 from threading import Thread
 import plotly.express as px
 import numpy as np
+from flask import Flask, send_file, request as flask_request
 
-os.makedirs("user_sessions", exist_ok=True)
+flask_app = Flask(__name__)
+
+USER_SESSIONS_DIR = os.path.abspath("user_sessions")
+os.makedirs(USER_SESSIONS_DIR, exist_ok=True)
+print(f"User sessions directory: {USER_SESSIONS_DIR}")
 
 default_examples = examples.copy()
 default_images = images.copy()
 default_coords = coords.copy()
+user_data = {}
+
+@flask_app.route('/plot/<session_hash>')
+def serve_user_plot(session_hash):
+    html_path = os.path.abspath(os.path.join("user_sessions", session_hash, "embedding_plot.html"))
+    print(f"Trying to serve file at: {html_path}")
+    print(f"File exists: {os.path.exists(html_path)}")
+    
+    if os.path.exists(html_path):
+        try:
+            return send_file(html_path, mimetype='text/html')
+        except Exception as e:
+            print(f"Error serving file: {e}")
+            return f"Error serving file: {e}", 500
+    else:
+        return f"Plot not found at {html_path}", 404
+
+def run_flask_server():
+    try:
+        print("Starting Flask server on port 8050")
+        flask_app.run(host='0.0.0.0', port=8050, debug=False, use_reloader=False)
+    except Exception as e:
+        print(f"Error starting Flask server: {e}")
+
+flask_thread = Thread(target=run_flask_server)
+flask_thread.daemon = True
+flask_thread.start()
 
 def generate_user_html(session_hash):
-    user_dir = os.path.join("user_sessions", session_hash)
+    user_dir = os.path.abspath(os.path.join("user_sessions", session_hash))
     os.makedirs(user_dir, exist_ok=True)
     
     html_path = os.path.join(user_dir, "embedding_plot.html")
@@ -35,12 +68,22 @@ def generate_user_html(session_hash):
         config={'responsive': True}
     )
     
+    print(f"Generated HTML at: {html_path}")
+    print(f"File exists after generation: {os.path.exists(html_path)}")
+    
+    try:
+        os.chmod(html_path, 0o644)
+    except Exception as e:
+        print(f"Warning: Could not set file permissions: {e}")
+    
     return html_path
 
 def init_user_session(request: gr.Request):
     session_hash = request.session_hash
     if not session_hash:
         session_hash = str(random.randint(10000, 99999))
+    
+    print(f"Initializing session for: {session_hash}")
     
     if session_hash not in user_data:
         user_data[session_hash] = {
@@ -74,9 +117,10 @@ def init_user_session(request: gr.Request):
     
     html_path = generate_user_html(session_hash)
     
-    return os.path.abspath(html_path)
-
-user_data = {}
+    timestamp = int(time.time())
+    flask_url = f"http://localhost:8050/plot/{session_hash}?t={timestamp}"
+    
+    return flask_url, session_hash
 
 def update_user_fig(session_hash):
     user_data[session_hash]["fig"].data[0].x = user_data[session_hash]["coords"][:, 0]
@@ -94,7 +138,8 @@ def update_user_fig(session_hash):
     
     html_path = generate_user_html(session_hash)
     
-    return html_path
+    timestamp = int(time.time())
+    return f"http://localhost:8050/plot/{session_hash}?t={timestamp}"
 
 def add_word_user(new_example, session_hash):
     user_examples = user_data[session_hash]["examples"]
@@ -207,9 +252,8 @@ def set_axis_user(axis_name, which_axis, from_words, to_words, session_hash):
     return update_user_fig(session_hash)
 
 with gr.Blocks(css="#step_size_circular {background-color: #666666} #step_size_circular textarea {background-color: #666666}") as demo:
-    gr.Markdown("## Stable Diffusion Demo")
+    gr.Markdown("## Stable Diffusion Embeddings Demo")
     
-    html_path_state = gr.State("")
     session_hash_state = gr.State("")
     
     with gr.TabItem("Embeddings"):
@@ -245,34 +289,33 @@ with gr.Blocks(css="#step_size_circular {background-color: #666666} #step_size_c
                 submit_1 = gr.Button("Submit")
         
         def load_user_html(request: gr.Request):
-            session_hash = request.session_hash
-            html_path = init_user_session(request)
+            flask_url, session_hash = init_user_session(request)
             html_content = f"""
-            <iframe id="html-frame" src="{html_path}" style="width:100%; height:700px;"></iframe>
+            <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
             """
-            return html_content, html_path, session_hash
+            return html_content, session_hash
         
-        demo.load(load_user_html, None, [output, html_path_state, session_hash_state])
+        demo.load(load_user_html, None, [output, session_hash_state])
         
         @word2add_rem.submit(inputs=[word2add_rem, session_hash_state], outputs=[output, word2add_rem])
         def add_rem_word_handler(words, session_hash):
-            html_path = add_rem_word_user(words, session_hash)
+            flask_url = add_rem_word_user(words, session_hash)
             html_content = f"""
-            <iframe id="html-frame" src="file://{html_path}" style="width:100%; height:700px;"></iframe>
+            <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
             """
             return html_content, ""
         
         @word2change.submit(inputs=[word2change, session_hash_state], outputs=[output, word2change])
         def change_word_handler(word, session_hash):
-            html_path = change_word_user(word, session_hash)
+            flask_url = change_word_user(word, session_hash)
             html_content = f"""
-            <iframe id="html-frame" src="file://{html_path}" style="width:100%; height:700px;"></iframe>
+            <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
             """
             return html_content, ""
         
         @clear_words_button.click(
             fn=lambda session_hash: (
-                f"""<iframe id="html-frame" src="file://{clear_words_user(session_hash)}" style="width:100%; height:700px;"></iframe>"""
+                f"""<iframe id="html-frame" src="{clear_words_user(session_hash)}" style="width:100%; height:700px;"></iframe>"""
             ),
             inputs=[session_hash_state],
             outputs=[output]
@@ -285,9 +328,9 @@ with gr.Blocks(css="#step_size_circular {background-color: #666666} #step_size_c
         def set_axis_wrapper(axis_name, which_axis, from_words, to_words, session_hash):
             whichAxisMap["which_axis_1"] = which_axis
             
-            html_path = set_axis_user(axis_name, which_axis, from_words, to_words, session_hash)
+            flask_url = set_axis_user(axis_name, which_axis, from_words, to_words, session_hash)
             html_content = f"""
-            <iframe id="html-frame" src="file://{html_path}" style="width:100%; height:700px;"></iframe>
+            <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
             """
             return html_content
 
