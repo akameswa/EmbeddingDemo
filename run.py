@@ -144,6 +144,10 @@ def generate_user_html(session_hash):
     
     return html_path
 
+def is_new_session(session_hash):
+    """Check if this is a new session"""
+    return session_hash not in user_data
+
 def init_user_session(request: gr.Request):
     session_hash = request.session_hash
     if not session_hash:
@@ -151,7 +155,9 @@ def init_user_session(request: gr.Request):
     
     print(f"Initializing session for: {session_hash}")
     
-    if session_hash not in user_data:
+    is_new = is_new_session(session_hash)
+    
+    if is_new:
         user_data[session_hash] = {
             "examples": default_examples.copy(),
             "images": default_images.copy(),
@@ -202,7 +208,7 @@ def init_user_session(request: gr.Request):
     timestamp = int(time.time())
     flask_url = f"http://localhost:8050/plot/{session_hash}?t={timestamp}"
     
-    return flask_url, session_hash
+    return flask_url, session_hash, is_new
 
 def update_user_fig(session_hash):
     user_data[session_hash]["fig"].data[0].x = user_data[session_hash]["coords"][:, 0]
@@ -497,17 +503,23 @@ with gr.Blocks(css="#step_size_circular {background-color: #666666} #step_size_c
                     show_label=True,
                     elem_id="gallery",
                     columns=4,
-                    height="auto"
+                    height="auto",
+                    object_fit="contain"  
                 )
     
     def load_user_html(request: gr.Request):
-        flask_url, session_hash = init_user_session(request)
+        flask_url, session_hash, is_new = init_user_session(request)
         html_content = f"""
         <iframe id="html-frame" src="{flask_url}" style="width:100%; height:700px;"></iframe>
         """
-        return html_content, session_hash
+        if is_new:
+            gr.Info("New session initialized.")
+        
+        gallery_images = load_user_gallery(session_hash)
+        
+        return html_content, session_hash, gallery_images
     
-    demo.load(load_user_html, None, [output, session_hash_state])
+    demo.load(load_user_html, None, [output, session_hash_state, gallery])
     
     @word2add_rem.submit(inputs=[word2add_rem, session_hash_state], outputs=[output, word2add_rem, gallery])
     def add_rem_word_handler(words, session_hash):
@@ -548,22 +560,15 @@ with gr.Blocks(css="#step_size_circular {background-color: #666666} #step_size_c
     @word_input.submit(inputs=[word_input, session_hash_state], outputs=[embedding_visualization, word_input, gallery])
     def handle_word_visualization(word, session_hash):
         if not word.strip():
-            return None, None, "Please enter a word", "", load_user_gallery(session_hash)
+            return None, "", load_user_gallery(session_hash)
             
         emb_viz, generated_img, label = generate_word_embedding_visualization(word, session_hash)
         
         if "not in examples" in label:
             gr.Warning(f"'{word}' not in examples. Please add it first using the Add/Remove word field.")
-            return None, None, "", load_user_gallery(session_hash)
+            return None, "", load_user_gallery(session_hash)
             
         return emb_viz, "", load_user_gallery(session_hash)
-        
-    @demo.load(inputs=[session_hash_state], outputs=[gallery])
-    def load_gallery_on_start(session_hash):
-        if not session_hash:
-            return []
-        return load_user_gallery(session_hash)
-
 
 if __name__ == "__main__":
     try:
